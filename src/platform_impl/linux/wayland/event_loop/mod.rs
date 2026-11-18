@@ -143,6 +143,10 @@ impl<T: 'static> EventLoop<T> {
             WaylandError::Calloop
         )?;
 
+        winit_state.awakener = Some(event_loop_awakener.clone());
+        *crate::platform_impl::wayland::state::GLOBAL_AWAKENER.lock().unwrap() =
+            Some(event_loop_awakener.clone());
+
         let result = event_loop
             .handle()
             .insert_source(event_loop_awakener_source, move |_, _, winit_state: &mut WinitState| {
@@ -459,6 +463,7 @@ impl<T: 'static> EventLoop<T> {
 
         // Handle non-synthetic events.
         self.with_state(|state| {
+            state.process_outgoing_drag_requests();
             buffer_sink.append(&mut state.events_sink);
         });
         for event in buffer_sink.drain() {

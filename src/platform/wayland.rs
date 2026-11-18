@@ -23,6 +23,11 @@ use crate::window::{Window, WindowAttributes};
 
 pub use crate::window::Theme;
 
+/// Start an outgoing Wayland drag-and-drop operation for files with optional preview image.
+pub fn start_drag(paths: Vec<String>, preview: Option<(u32, u32, Vec<u8>)>) {
+    crate::platform_impl::wayland::state::request_wayland_drag(paths, preview);
+}
+
 /// Additional methods on [`ActiveEventLoop`] that are specific to Wayland.
 pub trait ActiveEventLoopExtWayland {
     /// True if the [`ActiveEventLoop`] uses Wayland.

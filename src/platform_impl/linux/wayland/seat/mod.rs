@@ -34,8 +34,11 @@ use touch::TouchPoint;
 
 #[derive(Debug, Default)]
 pub struct WinitSeatState {
+    /// The data device bound on the seat for Drag and Drop.
+    pub data_device: Option<sctk::data_device_manager::data_device::DataDevice>,
+
     /// The pointer bound on the seat.
-    pointer: Option<Arc<ThemedPointer<WinitPointerData>>>,
+    pub pointer: Option<Arc<ThemedPointer<WinitPointerData>>>,
 
     /// The touch bound on the seat.
     touch: Option<WlTouch>,
@@ -202,10 +205,13 @@ impl SeatHandler for WinitState {
     fn new_seat(
         &mut self,
         _connection: &Connection,
-        _queue_handle: &QueueHandle<Self>,
+        queue_handle: &QueueHandle<Self>,
         seat: WlSeat,
     ) {
-        self.seats.insert(seat.id(), WinitSeatState::new());
+        let mut seat_state = WinitSeatState::new();
+        let data_device = self.data_device_manager_state.get_data_device(queue_handle, &seat);
+        seat_state.data_device = Some(data_device);
+        self.seats.insert(seat.id(), seat_state);
     }
 
     fn remove_seat(

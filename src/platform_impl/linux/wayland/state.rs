@@ -23,6 +23,15 @@ use sctk::shm::slot::SlotPool;
 use sctk::shm::{Shm, ShmHandler};
 use sctk::subcompositor::SubcompositorState;
 
+use sctk::data_device_manager::data_device::DataDeviceHandler;
+use sctk::data_device_manager::data_offer::{DataOfferHandler, DragOffer};
+use sctk::data_device_manager::data_source::{DataSourceHandler, DragSource};
+use sctk::data_device_manager::{DataDeviceManagerState, WritePipe};
+use sctk::reexports::client::protocol::wl_data_device::WlDataDevice;
+use sctk::reexports::client::protocol::wl_data_device_manager::DndAction;
+use sctk::reexports::client::protocol::wl_data_source::WlDataSource;
+use sctk::reexports::client::protocol::wl_shm::Format;
+
 use crate::platform_impl::wayland::event_loop::sink::EventSink;
 use crate::platform_impl::wayland::output::MonitorHandle;
 use crate::platform_impl::wayland::seat::{
@@ -109,12 +118,46 @@ pub struct WinitState {
     /// KWin blur manager.
     pub kwin_blur_manager: Option<KWinBlurManager>,
 
+    /// Data device manager for Wayland Drag & Drop support.
+    pub data_device_manager_state: DataDeviceManagerState,
+
+    /// Active drag offer during DnD.
+    pub current_drag_offer: Option<(WindowId, DragOffer)>,
+
+    /// Ping handle to wake up the event loop from background tasks.
+    pub awakener: Option<calloop::ping::Ping>,
+
+    /// Queue handle to create wayland objects like drag sources.
+    pub queue_handle: QueueHandle<Self>,
+
+    /// Outgoing drag sources active on Wayland.
+    pub outgoing_drag_sources: Vec<OutgoingDrag>,
+
     /// Loop handle to re-register event sources, such as keyboard repeat.
     pub loop_handle: LoopHandle<'static, Self>,
 
     /// Whether we have dispatched events to the user thus we want to
     /// send `AboutToWait` and normally wakeup the user.
     pub dispatched_events: bool,
+}
+
+pub struct DragRequest {
+    pub paths: Vec<String>,
+    pub preview: Option<(u32, u32, Vec<u8>)>,
+}
+
+/// An in-flight outgoing drag: the source, the file paths, the icon surface and
+/// its buffer pool.
+pub type OutgoingDrag = (DragSource, Vec<String>, Option<WlSurface>, Option<SlotPool>);
+
+pub static OUTGOING_DRAG_REQUEST: Mutex<Option<DragRequest>> = Mutex::new(None);
+pub static GLOBAL_AWAKENER: Mutex<Option<calloop::ping::Ping>> = Mutex::new(None);
+
+pub fn request_wayland_drag(paths: Vec<String>, preview: Option<(u32, u32, Vec<u8>)>) {
+    *OUTGOING_DRAG_REQUEST.lock().unwrap() = Some(DragRequest { paths, preview });
+    if let Some(ref aw) = *GLOBAL_AWAKENER.lock().unwrap() {
+        aw.ping();
+    }
 }
 
 impl WinitState {
@@ -143,9 +186,15 @@ impl WinitState {
 
         let seat_state = SeatState::new(globals, queue_handle);
 
+        let data_device_manager_state = DataDeviceManagerState::bind(globals, queue_handle)
+            .expect("wl_data_device_manager is required for DnD");
+
         let mut seats = AHashMap::default();
         for seat in seat_state.seats() {
-            seats.insert(seat.id(), WinitSeatState::new());
+            let mut seat_st = WinitSeatState::new();
+            seat_st.data_device =
+                Some(data_device_manager_state.get_data_device(queue_handle, &seat));
+            seats.insert(seat.id(), seat_st);
         }
 
         let (viewporter_state, fractional_scaling_manager) =
@@ -166,6 +215,12 @@ impl WinitState {
             seat_state,
             shm,
             custom_cursor_pool,
+
+            data_device_manager_state,
+            current_drag_offer: None,
+            awakener: None,
+            queue_handle: queue_handle.clone(),
+            outgoing_drag_sources: Vec::new(),
 
             xdg_shell: XdgShell::bind(globals, queue_handle).map_err(WaylandError::Bind)?,
             xdg_activation: XdgActivationState::bind(globals, queue_handle).ok(),
@@ -433,3 +488,403 @@ sctk::delegate_registry!(WinitState);
 sctk::delegate_shm!(WinitState);
 sctk::delegate_xdg_shell!(WinitState);
 sctk::delegate_xdg_window!(WinitState);
+sctk::delegate_data_device!(WinitState);
+
+impl DataOfferHandler for WinitState {
+    fn source_actions(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _offer: &mut DragOffer,
+        _actions: DndAction,
+    ) {
+    }
+
+    fn selected_action(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _offer: &mut DragOffer,
+        _actions: DndAction,
+    ) {
+    }
+}
+
+impl DataSourceHandler for WinitState {
+    fn accept_mime(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _source: &WlDataSource,
+        _mime: Option<String>,
+    ) {
+    }
+
+    fn send_request(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        source: &WlDataSource,
+        mime: String,
+        fd: WritePipe,
+    ) {
+        if let Some((_, paths, ..)) =
+            self.outgoing_drag_sources.iter().find(|item| item.0.inner() == source)
+        {
+            use std::io::Write;
+            use std::os::fd::{FromRawFd, IntoRawFd};
+
+            let mut file = unsafe { std::fs::File::from_raw_fd(fd.into_raw_fd()) };
+            if mime == "text/uri-list" {
+                let uris: Vec<String> = paths
+                    .iter()
+                    .map(|p| {
+                        let clean = p.replace('\\', "/");
+                        let parts: Vec<String> = clean
+                            .split('/')
+                            .map(|seg| {
+                                let mut enc = String::new();
+                                for b in seg.bytes() {
+                                    if b.is_ascii_alphanumeric()
+                                        || b == b'-'
+                                        || b == b'_'
+                                        || b == b'.'
+                                        || b == b'~'
+                                        || b == b'/'
+                                    {
+                                        enc.push(b as char);
+                                    } else {
+                                        enc.push_str(&format!("%{b:02X}"));
+                                    }
+                                }
+                                enc
+                            })
+                            .collect();
+                        format!("file://{}\r\n", parts.join("/"))
+                    })
+                    .collect();
+                let _ = file.write_all(uris.concat().as_bytes());
+            } else if mime == "x-special/gnome-copied-files" {
+                let uris: Vec<String> = paths.iter().map(|p| format!("file://{p}")).collect();
+                let body = format!("copy\n{}", uris.join("\n"));
+                let _ = file.write_all(body.as_bytes());
+            } else {
+                let _ = file.write_all(paths.join("\n").as_bytes());
+            }
+            let _ = file.flush();
+        }
+    }
+
+    fn cancelled(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, source: &WlDataSource) {
+        self.outgoing_drag_sources.retain(|item| item.0.inner() != source);
+    }
+
+    fn dnd_dropped(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _source: &WlDataSource) {
+    }
+
+    fn dnd_finished(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, source: &WlDataSource) {
+        self.outgoing_drag_sources.retain(|item| item.0.inner() != source);
+    }
+
+    fn action(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _source: &WlDataSource,
+        _action: DndAction,
+    ) {
+    }
+}
+
+impl WinitState {
+    pub fn process_outgoing_drag_requests(&mut self) {
+        let req = match OUTGOING_DRAG_REQUEST.lock().unwrap().take() {
+            Some(r) => r,
+            None => return,
+        };
+
+        let paths = req.paths;
+        if paths.is_empty() {
+            return;
+        }
+
+        let mut target_seat_and_serial = None;
+        for seat_state in self.seats.values() {
+            if let Some(ref data_device) = seat_state.data_device {
+                if let Some(ref pointer) = seat_state.pointer {
+                    let serial = pointer.pointer().winit_data().latest_button_serial();
+                    if serial != 0 {
+                        target_seat_and_serial = Some((data_device, serial));
+                        break;
+                    }
+                }
+            }
+        }
+
+        let (data_device, serial) = match target_seat_and_serial {
+            Some(s) => s,
+            None => return,
+        };
+
+        let surface = {
+            let windows = self.windows.borrow();
+            match windows.values().next() {
+                Some(w) => w.lock().unwrap().window.wl_surface().clone(),
+                None => return,
+            }
+        };
+
+        // Strictly advertise Copy action so target file managers copy, never move.
+        let drag_source = self.data_device_manager_state.create_drag_and_drop_source(
+            &self.queue_handle,
+            vec![
+                "text/uri-list".to_string(),
+                "x-special/gnome-copied-files".to_string(),
+                "text/plain;charset=utf-8".to_string(),
+                "text/plain".to_string(),
+            ],
+            DndAction::Copy,
+        );
+
+        // Build the drag icon surface, either a supplied preview or a default card.
+        let icon_surface = self.compositor_state.create_surface(&self.queue_handle);
+        let (icon_surf_opt, pool_opt) = if let Some((w, h, bgra)) = req.preview {
+            let width = (w as usize).clamp(16, 256);
+            let height = (h as usize).clamp(16, 256);
+            let stride = width * 4;
+            if let Ok(mut pool) = SlotPool::new(width * height * 4, &self.shm) {
+                if let Ok((buffer, canvas)) =
+                    pool.create_buffer(width as i32, height as i32, stride as i32, Format::Argb8888)
+                {
+                    if bgra.len() == width * height * 4 {
+                        canvas.copy_from_slice(&bgra);
+                    }
+                    buffer.attach_to(&icon_surface).ok();
+                    icon_surface.damage(0, 0, width as i32, height as i32);
+                    icon_surface.commit();
+                    (Some(icon_surface), Some(pool))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
+        } else {
+            // Default pill card fallback.
+            let width = 160;
+            let height = 36;
+            let stride = width * 4;
+            if let Ok(mut pool) = SlotPool::new(width * height * 4, &self.shm) {
+                if let Ok((buffer, canvas)) =
+                    pool.create_buffer(width as i32, height as i32, stride as i32, Format::Argb8888)
+                {
+                    for (i, chunk) in canvas.chunks_exact_mut(4).enumerate() {
+                        let px = (i % width) as i32;
+                        let py = (i / width) as i32;
+                        let is_border =
+                            px < 2 || px >= width as i32 - 2 || py < 2 || py >= height as i32 - 2;
+                        if is_border {
+                            chunk[0] = 255;
+                            chunk[1] = 140;
+                            chunk[2] = 160;
+                            chunk[3] = 255;
+                        } else {
+                            chunk[0] = 240;
+                            chunk[1] = 85;
+                            chunk[2] = 120;
+                            chunk[3] = 210;
+                        }
+                    }
+                    buffer.attach_to(&icon_surface).ok();
+                    icon_surface.damage(0, 0, width as i32, height as i32);
+                    icon_surface.commit();
+                    (Some(icon_surface), Some(pool))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
+        };
+
+        if let Some(ref icon_surf) = icon_surf_opt {
+            drag_source.start_drag(data_device, &surface, Some(icon_surf), serial);
+        } else {
+            drag_source.start_drag(data_device, &surface, None, serial);
+        }
+
+        self.outgoing_drag_sources.push((drag_source, paths, icon_surf_opt, pool_opt));
+    }
+}
+
+fn pick_dnd_mime_type(offer: &DragOffer) -> Option<String> {
+    offer.with_mime_types(|mimes| {
+        for target in &[
+            "text/uri-list",
+            "x-special/gnome-copied-files",
+            "text/plain;charset=utf-8",
+            "text/plain",
+        ] {
+            if let Some(m) = mimes.iter().find(|m| m.as_str() == *target) {
+                return Some(m.clone());
+            }
+        }
+        mimes.first().cloned()
+    })
+}
+
+impl DataDeviceHandler for WinitState {
+    fn enter(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        data_device: &WlDataDevice,
+        _x: f64,
+        _y: f64,
+        surface: &WlSurface,
+    ) {
+        let window_id = super::make_wid(surface);
+        if let Some(seat) = self
+            .seats
+            .values()
+            .find(|s| s.data_device.as_ref().map(|d| d.inner()) == Some(data_device))
+        {
+            if let Some(offer) = seat.data_device.as_ref().and_then(|d| d.data().drag_offer()) {
+                if let Some(mime) = pick_dnd_mime_type(&offer) {
+                    offer.accept_mime_type(offer.serial, Some(mime));
+                }
+                offer.set_actions(DndAction::Copy, DndAction::Copy);
+                self.current_drag_offer = Some((window_id, offer.clone()));
+            }
+        }
+        self.events_sink.push_window_event(
+            crate::event::WindowEvent::HoveredFile(std::path::PathBuf::new()),
+            window_id,
+        );
+    }
+
+    fn leave(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _data_device: &WlDataDevice) {
+        if let Some((window_id, _)) = self.current_drag_offer.take() {
+            self.events_sink
+                .push_window_event(crate::event::WindowEvent::HoveredFileCancelled, window_id);
+        }
+    }
+
+    fn motion(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _data_device: &WlDataDevice,
+        _x: f64,
+        _y: f64,
+    ) {
+        if let Some((_, offer)) = &self.current_drag_offer {
+            if let Some(mime) = pick_dnd_mime_type(offer) {
+                offer.accept_mime_type(offer.serial, Some(mime));
+            }
+            offer.set_actions(DndAction::Copy, DndAction::Copy);
+        }
+    }
+
+    fn selection(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _data_device: &WlDataDevice,
+    ) {
+    }
+
+    fn drop_performed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _data_device: &WlDataDevice,
+    ) {
+        if let Some((window_id, offer)) = self.current_drag_offer.take() {
+            let mime = pick_dnd_mime_type(&offer).unwrap_or_else(|| "text/uri-list".to_string());
+            offer.accept_mime_type(offer.serial, Some(mime.clone()));
+            offer.set_actions(DndAction::Copy, DndAction::Copy);
+            if let Ok(mut read_pipe) = offer.receive(mime) {
+                let sink = self.window_events_sink.clone();
+                let awakener = self.awakener.clone();
+                std::thread::spawn(move || {
+                    use std::io::Read;
+
+                    let mut buffer = String::new();
+                    let read_ok = read_pipe.read_to_string(&mut buffer).is_ok();
+                    offer.finish();
+                    offer.destroy();
+
+                    let mut found_any = false;
+                    if read_ok {
+                        for line in buffer.lines() {
+                            let line = line.trim();
+                            if line.is_empty()
+                                || line.starts_with('#')
+                                || line == "copy"
+                                || line == "cut"
+                            {
+                                continue;
+                            }
+                            let decoded_opt = if let Some(path_str) = line.strip_prefix("file://") {
+                                Some(decode_uri_component(path_str))
+                            } else if line.starts_with('/') {
+                                Some(line.to_string())
+                            } else {
+                                None
+                            };
+
+                            if let Some(decoded) = decoded_opt {
+                                if !decoded.is_empty() {
+                                    let p = std::path::PathBuf::from(decoded);
+                                    sink.lock().unwrap().push_window_event(
+                                        crate::event::WindowEvent::DroppedFile(p),
+                                        window_id,
+                                    );
+                                    found_any = true;
+                                }
+                            }
+                        }
+                    }
+
+                    if !found_any {
+                        sink.lock().unwrap().push_window_event(
+                            crate::event::WindowEvent::HoveredFileCancelled,
+                            window_id,
+                        );
+                    }
+
+                    if let Some(aw) = awakener {
+                        aw.ping();
+                    }
+                });
+            } else {
+                offer.finish();
+                offer.destroy();
+                self.events_sink
+                    .push_window_event(crate::event::WindowEvent::HoveredFileCancelled, window_id);
+            }
+        }
+    }
+}
+
+fn decode_uri_component(s: &str) -> String {
+    let mut bytes = Vec::new();
+    let mut chars = s.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let h1 = chars.next();
+            let h2 = chars.next();
+            if let (Some(h1), Some(h2)) = (h1, h2) {
+                if let Ok(val) =
+                    u8::from_str_radix(std::str::from_utf8(&[h1, h2]).unwrap_or("0"), 16)
+                {
+                    bytes.push(val);
+                    continue;
+                }
+            }
+        }
+        bytes.push(b);
+    }
+    String::from_utf8_lossy(&bytes).to_string()
+}

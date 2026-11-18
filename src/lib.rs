@@ -215,3 +215,9 @@ mod utils;
 pub mod window;
 
 pub mod platform;
+
+/// Start an outgoing Wayland drag-and-drop operation for files with optional preview image.
+pub fn start_drag_files(paths: Vec<String>, preview: Option<(u32, u32, Vec<u8>)>) {
+    #[cfg(feature = "wayland")]
+    crate::platform::wayland::start_drag(paths, preview);
+}
